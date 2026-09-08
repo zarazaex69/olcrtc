@@ -100,8 +100,13 @@ type sealState struct {
 	counter atomic.Uint64
 }
 
+type replayKey struct {
+	prefix [noncePrefixSize]byte
+	aad    uint64
+}
+
 type replayState struct {
-	prefix  [noncePrefixSize]byte
+	key     replayKey
 	highest uint64
 	seen    uint64
 	element *list.Element
@@ -109,8 +114,21 @@ type replayState struct {
 
 type replayCache struct {
 	mu      sync.Mutex
-	senders map[[noncePrefixSize]byte]*replayState
+	senders map[replayKey]*replayState
 	lru     list.List
+}
+
+func aadTag(aad []byte) uint64 {
+	const (
+		offsetBasis = 14695981039346656037
+		prime       = 1099511628211
+	)
+	tag := uint64(offsetBasis)
+	for _, b := range aad {
+		tag ^= uint64(b)
+		tag *= prime
+	}
+	return tag
 }
 
 // KeySet owns one directional sender and shared receive replay state.
@@ -167,7 +185,7 @@ func newKeySetForRole(clientKey, serverKey [chacha20poly1305.KeySize]byte, role 
 	keys := &KeySet{
 		send:    sealState{aead: sendAEAD},
 		receive: receiveAEAD,
-		replay:  replayCache{senders: make(map[[noncePrefixSize]byte]*replayState, maxReplaySenders)},
+		replay:  replayCache{senders: make(map[replayKey]*replayState, maxReplaySenders)},
 	}
 	if _, err := rand.Read(keys.send.prefix[:]); err != nil {
 		return nil, fmt.Errorf("seed sender nonce prefix: %w", err)
@@ -251,18 +269,18 @@ func (k *KeySet) OpenInto(dst, record, aad []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open record: %w", ErrAuthentication)
 	}
-	if err := k.replay.accept(prefix, counter); err != nil {
+	if err := k.replay.accept(replayKey{prefix: prefix, aad: aadTag(aad)}, counter); err != nil {
 		return nil, fmt.Errorf("open record: %w", err)
 	}
 	return plaintext, nil
 }
 
-func (r *replayCache) accept(prefix [noncePrefixSize]byte, counter uint64) error {
+func (r *replayCache) accept(key replayKey, counter uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.senders[prefix]
+	state := r.senders[key]
 	if state == nil {
-		r.insert(prefix, counter)
+		r.insert(key, counter)
 		return nil
 	}
 	if counter > state.highest {
@@ -289,16 +307,16 @@ func (r *replayCache) accept(prefix [noncePrefixSize]byte, counter uint64) error
 	return nil
 }
 
-func (r *replayCache) insert(prefix [noncePrefixSize]byte, counter uint64) {
+func (r *replayCache) insert(key replayKey, counter uint64) {
 	if len(r.senders) >= maxReplaySenders {
 		oldest := r.lru.Back()
 		state, ok := oldest.Value.(*replayState)
 		if ok {
-			delete(r.senders, state.prefix)
+			delete(r.senders, state.key)
 		}
 		r.lru.Remove(oldest)
 	}
-	state := &replayState{prefix: prefix, highest: counter, seen: 1}
+	state := &replayState{key: key, highest: counter, seen: 1}
 	state.element = r.lru.PushFront(state)
-	r.senders[prefix] = state
+	r.senders[key] = state
 }

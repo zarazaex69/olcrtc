@@ -211,7 +211,7 @@ func TestReplayStateUsesBoundedLRU(t *testing.T) {
 		t.Fatalf("sender states = %d, want %d", len(server.replay.senders), maxReplaySenders)
 	}
 	var first [noncePrefixSize]byte
-	if _, ok := server.replay.senders[first]; ok {
+	if _, ok := server.replay.senders[replayKey{prefix: first, aad: aadTag([]byte(testDataAAD))}]; ok {
 		t.Fatal("least-recently-used sender was not evicted")
 	}
 }
@@ -316,5 +316,25 @@ func BenchmarkRecordRoundTrip(b *testing.B) {
 		if _, err := server.Open(record, aad); err != nil {
 			b.Fatalf("Open() error = %v", err)
 		}
+	}
+}
+
+func TestOpenKeepsIndependentWindowsPerAAD(t *testing.T) {
+	client, server := newKeyPair(t)
+	control, err := client.Seal([]byte("control"), []byte(testControlAAD))
+	if err != nil {
+		t.Fatalf("Seal(control) error = %v", err)
+	}
+	for i := range replayWindowSize * 2 {
+		data, sealErr := client.Seal([]byte("data"), []byte(testDataAAD))
+		if sealErr != nil {
+			t.Fatalf("Seal(data %d) error = %v", i, sealErr)
+		}
+		if _, openErr := server.Open(data, []byte(testDataAAD)); openErr != nil {
+			t.Fatalf("Open(data %d) error = %v", i, openErr)
+		}
+	}
+	if _, err := server.Open(control, []byte(testControlAAD)); err != nil {
+		t.Fatalf("Open(control) after %d data records error = %v", replayWindowSize*2, err)
 	}
 }
